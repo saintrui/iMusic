@@ -5,6 +5,8 @@ var pool  = mysql.createPool ({
     password : 'success'
 });
 var phantom = require ('phantom'), ph_;
+var WAIT_PH_EXIT_TIMEOUT = 2000;    // milliseconds
+var PHANTOM_PAGE_CNT = 100; // the threshold of page cnt that phantom process exit
 
 var toHTML = {
     on: function(str) {
@@ -77,6 +79,32 @@ var insertSongs = function (conn, artists, idx, start, ting_uid, songs, sidx) {
             console.log ('insert song ' + song[0] + ' succeed');
         }
         insertSongs (conn, artists, idx, start, ting_uid, songs, sidx + 1);
+    });
+};
+
+var insertSongResource = function (conn, songs, idx, downloads) {
+    var song = songs[idx];
+    var sql = 'INSERT INTO music.song_resource SET song_id = ?, download_page = ?,'
+        + ' url_standard = ?, url_high = ?, url_super = ?, created_at = NOW()';
+    var params = [song.id, song.page_link_baidu + '/download', downloads[0], downloads[1], downloads[2]];
+    console.log ('begin to insert song download url of ' + song.name);
+    console.log (downloads);
+    conn.query (sql, params, function (err, info) {
+        if (err) {
+            console.log (err);
+        } else {
+            console.log ('insert song ' + song.name + ' download url succeed');
+        }
+        conn.release ();
+        if (idx % PHANTOM_PAGE_CNT == 0) {
+            ph_.exit ();
+            ph_ = null;
+            setTimeout (function () {
+                discoverSongDownloadUrl (songs, idx + 1);
+            }, WAIT_PH_EXIT_TIMEOUT);
+        } else {
+            discoverSongDownloadUrl (songs, idx + 1);
+        }
     });
 };
 
@@ -185,7 +213,7 @@ var doNextPage = function (artists, idx, start, ting_uid) {
                     ph_ = null;
                     setTimeout (function () {
                         discoverSongsOfArtist (artists, idx + 1);
-                    }, 3000);
+                    }, WAIT_PH_EXIT_TIMEOUT);
                 }
             });
         });
@@ -223,6 +251,78 @@ var discoverSongsOfArtists = function () {
     });
 };
 
+// parse download url
+var parseDownload = function (songs, idx) {
+    ph_.createPage (function (page) {
+        page.set ('onConsoleMessage', function (msg) {
+            console.log ('get console msg: ' + msg);
+        });
+        console.log("Page created!")
+        var song = songs[idx];
+        var url = song.page_link_baidu + '/download';
+        page.open (url, function (status) {
+            console.log ('open ' + url + ', status ' + status);
+            if (status != "success") {
+                console.log("failed to open " + url);
+                process.exit (1);
+            }
+            page.injectJs ("jquery-2.0.3.min.js");
+            page.evaluate (function () {
+                var downloads = ['', '', ''];
+                var prefix = 'http://music.baidu.com';
+                // TBD need login to get the high quality music download url
+                var href = $('#128').attr ('href');
+                if (href != undefined)
+                    downloads[0] = prefix + href;
+                return downloads;
+            }, function (downloads) {
+                page.close ();
+                pool.getConnection (function (err, conn) {
+                    insertSongResource (conn, songs, idx, downloads);
+                });
+            });
+        });
+    });
+};
+
+// discover song download url
+var discoverSongDownloadUrl = function (songs, idx) {
+    if (songs.length == idx) {
+        console.log ('finish discover songs download url, totally discover songs count ' + idx);
+        return;
+    }
+    var song = songs[idx];
+    console.log (idx + '/' + songs.length + ' start to discover song ' + song.name);
+
+    if (null == ph_) {
+        phantom.create ("--load-images=false", "--web-security=no", "--ignore-ssl-errors=yes", {port: 12347}, function (ph) {
+            console.log ("Phantom Bridge Initiated")
+            ph_ = ph;
+            parseDownload (songs, idx);
+        });
+    } else {
+        parseDownload (songs, idx);
+    }
+};
+
+// entry to discover songs download url
+var discoverSongsDownloadUrl = function () {
+    pool.getConnection (function (err, conn) {
+        var sql = 'SELECT id, name, page_link_baidu FROM music.song AS a '
+                + ' WHERE NOT EXISTS (SELECT 1 FROM music.song_resource AS b WHERE a.id = b.song_id)';
+        console.log (sql);
+        conn.query (sql, function (err, results, fields) {
+            if (err) {
+                console.log (err);
+                process.exit (1);
+            }
+            conn.release ();
+            discoverSongDownloadUrl (results, 0);
+        });
+    });
+};
+
 // main
 //discoverArtists ();
-discoverSongsOfArtists ();
+//discoverSongsOfArtists ();
+discoverSongsDownloadUrl ();
